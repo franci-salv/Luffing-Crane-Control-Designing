@@ -1,0 +1,278 @@
+% Parameters
+d_w = 100;
+target_fc_hz = 0.06;
+wc_target = target_fc_hz * 2 * pi; % Target crossover (~0.1571 rad/s)
+
+% 1. Define Plant G(s)
+num_G = [5.1e-3, (0.2 + 0.049 * d_w), 250];
+den_G = [5e5, (5e4 + 100 * d_w), 6.2e5, 4.9e4, 0];
+G = tf(num_G, den_G);
+
+% 1. Setup
+
+poles = pole(G);
+% Find the pole with a significant imaginary part
+res_freq = abs(poles(imag(poles) > 0.5)); 
+disp(res_freq(1));
+%fprintf('Exact Resonance Frequency: %.4f rad/s\n', w_res);
+
+% --- 1. Hardcode the values you found from the plant plot ---
+w_z = 1.11;    % Use the exact peak freq you see on G(s) Bode
+w_p = 1.11;
+beta_z = 0.05; % Use a small number (Plant resonance is sharp)
+beta_p = 0.8;  % Use a large number (To create a deep dip)
+
+% --- 2. Run the loop ---
+target_wc = target_fc_hz * 2 * pi;
+alphas = 1:0.1:40; 
+best_alpha = NaN;
+best_K = NaN;
+
+for a = alphas
+    % Build controller shape
+    C_s = tf([a/target_wc, 1], [1/(a*target_wc), 1]);
+    C_notch = (w_p/w_z)^2 * tf([1, 2*beta_z*w_z, w_z^2], [1, 2*beta_p*w_p, w_p^2]);
+    C_total = C_notch * C_s;
+    
+    % Force crossover at 0.06 Hz
+    K_val = 1 / abs(evalfr(C_total * G, 1i * target_wc));
+    
+    % Test metrics
+    L_test = K_val * C_total * G;
+    S_test = feedback(1, L_test);
+    
+    % Use a safe frequency range for the search
+    [magS, ~] = bode(S_test, logspace(-2, 1, 500));
+    Ms_db = 20*log10(max(squeeze(magS)));
+    
+    if isstable(feedback(L_test, 1)) && Ms_db <= 6 
+        best_alpha = a;
+        best_K = K_val;
+        break; 
+    end
+end
+
+% --- 3. ONLY run the rest if alpha is NOT NaN ---
+if ~isnan(best_alpha)
+    % Re-assign the variables so the print/plot code below works
+    
+    % ... [Rest of your C2, L2, S definitions and Print statements] ...
+else
+    fprintf('Loop failed to find alpha. Try beta_p = 0.9 or changing w_z.\n');
+end
+% 2. Design Controller C2(s)
+% Motivation: alpha scales the "lead" effect. For this system, a higher alpha 
+% provides more phase lead at wc, pushing the Nyquist plot away from -1.
+alpha = best_alpha; % Increased alpha to improve stability and Modulus Margin
+w_c_param = wc_target; 
+
+
+% --- Parameters for the new complex term ---
+% Ensure you have defined w_z, w_p, beta_z, and beta_p before this
+num_complex = [1, 2*beta_z*w_z, w_z^2];         % s^2 + 2*beta_z*w_z*s + w_z^2
+den_complex = [1, 2*beta_p*w_p, w_p^2];         % s^2 + 2*beta_p*w_p*s + w_p^2
+gain_ratio = (w_p / w_z)^2;
+
+% Create the complex fraction transfer function
+C_complex = gain_ratio * tf(num_complex, den_complex);
+
+% --- Updated Controller Calculation ---
+% Base shape of the lead/lag part (your original C2_shape)
+C2_lead_lag = tf([alpha/w_c_param, 1], [1/(alpha*w_c_param), 1]);
+
+% Combined shape (Lead-Lag * Complex Fraction)
+C2_total_shape = C2_lead_lag * C_complex;
+
+% Recalculate K based on the combined shape to maintain crossover frequency
+mag_at_wc = abs(evalfr(C2_total_shape * G, 1i * wc_target));
+K = best_K;
+
+% Final Controller
+C2 = K * C2_total_shape;
+
+% Open-Loop and Closed-Loop
+L2 = C2 * G;
+T = feedback(L2, 1);
+S = feedback(1, L2);
+
+% 4. Verify Requirements
+[gm, pm, wcg, wcp] = margin(L2);
+f_c_actual = wcp / (2*pi);
+
+% Calculate Modulus Margin (MM)
+% MM is the minimum distance from L(jw) to the -1 point.
+% This is equivalent to 1/max(abs(S))
+[magS, ~] = bode(S, logspace(-3, 2, 1000));
+Ms_linear = max(squeeze(magS));
+Ms_db = 20*log10(Ms_linear); % Sensitivity peak in dB
+MM_linear = 1 / Ms_linear;   % Distance from -1
+
+% 5. Print Results
+fprintf('--- Controller Parameters ---\n');
+fprintf('K:     %.4f\n', K);
+fprintf('alpha: %.2f\n', alpha);
+fprintf('wc:    %.4f rad/s\n', w_c_param);
+
+fprintf('\n--- Performance Metrics ---\n');
+fprintf('Crossover Freq: %.4f Hz (Target: 0.06)\n', f_c_actual);
+fprintf('Sensitivity Peak (Ms): %.2f dB (Requirement: <= 6dB)\n', Ms_db);
+fprintf('Phase Margin:   %.2f degrees\n', pm);
+
+% Final Stability Check
+if isstable(T) && abs(f_c_actual - target_fc_hz) < 0.001 && Ms_db <= 6
+    fprintf('\nSTATUS: ALL REQUIREMENTS MET\n');
+else
+    fprintf('\nSTATUS: REQUIREMENTS NOT MET\n');
+    if ~isstable(T), fprintf('  [!] System is still Unstable. Try increasing alpha.\n'); end
+    if Ms_db > 6,    fprintf('  [!] Modulus Margin requirement failed (Ms > 6dB).\n'); end
+end
+
+figure(1); margin(L2); grid on;
+
+
+%question f)
+
+%% CONTROLLER 1
+alpha1 = 1.5; % Increased alpha to improve stability and Modulus Margin
+w_c_param = 0.025; 
+
+% Base shape of the controller (Equation 3 without K)
+C_shape = tf([alpha1/w_c_param, 1], [1/(alpha1*w_c_param), 1]);
+
+% 3. Calculate K analytically to force crossover at wc_target
+% Magnitude condition: |K * C_shape(j*wc) * G(j*wc)| = 1
+mag_at_wc = abs(evalfr(C_shape * G, 1i * w_c_param));
+K1 = 44.6632;
+
+% Final Controller and Open-Loop/Closed-Loop Transfer Functions
+C1 = K1 * C_shape;
+L1 = C1 * G;
+T = feedback(L1, 1);
+S = feedback(1, L1); % Sensitivity function
+
+
+% Time vector
+t = 0:0.01:100;
+
+% Closed-loop systems for C2
+T2 = feedback(C2*G, 1); % Tracking (Output xl)
+S2 = feedback(1, C2*G); % Error (e)
+
+% Closed-loop systems for C1 (Ensure C1 is defined from your 6c code)
+T1 = feedback(C1*G, 1); 
+S1 = feedback(1, C1*G);
+
+% Step Responses
+[xl2, ~] = step(T2, t);
+[e2, ~]  = step(S2, t);
+[xl1, ~] = step(T1, t);
+[e1, ~]  = step(S1, t);
+
+% --- Plotting ---
+figure(2);
+subplot(2,1,1);
+plot(t, xl2, 'b', 'LineWidth', 1.5); hold on;
+plot(t, xl1, 'r--', 'LineWidth', 1.5);
+grid on; ylabel('Output x_l [m]');
+legend('C2 (Notch)', 'C1 (Lead-Lag)');
+title('Step Response Comparison');
+
+subplot(2,1,2);
+plot(t, e2, 'b', 'LineWidth', 1.5); hold on;
+plot(t, e1, 'r--', 'LineWidth', 1.5);
+plot([0 100], [0.025 0.025], 'k:', 'HandleVisibility', 'off'); % Upper limit
+plot([0 100], [-0.025 -0.025], 'k:', 'HandleVisibility', 'off'); % Lower limit
+grid on; ylabel('Error e [m]'); xlabel('Time [s]');
+legend('Error C2', 'Error C1');
+
+% --- Finding Settling Time for |e(t)| < 0.025 ---
+% We look for the last time the absolute error exceeds the threshold
+idx = find(abs(e2) >= 0.025, 1, 'last');
+if isempty(idx)
+    t_settle = 0; % Already below threshold
+else
+    t_settle = t(idx);
+end
+
+fprintf('\n--- Settling Time Analysis ---\n');
+fprintf('Settling time for |e(t)| < 0.025m with C2: %.2f seconds\n', t_settle);
+
+% question g)
+
+% Define Sensitivity Functions
+S1 = feedback(1, C1*G);
+S2 = feedback(1, C2*G);
+
+% Bode Plot
+figure(3);
+options = bodeoptions;
+options.MagUnits = 'dB';
+options.FreqUnits = 'Hz'; % Using Hz to match assignment requirements
+options.Grid = 'on';
+
+bodeplot(S1, 'r--', S2, 'b', options);
+title('Sensitivity Function Comparison: S1 (Lead-Lag) vs S2 (Notch)');
+legend('S1 (Original)', 'S2 (With Notch Filter)');
+
+%Suppression of Resonance Oscillations: The primary benefit is the "cleaning up" of the plant's resonance. By placing the notch zeros exactly at the plant's resonance frequency ($\approx 1.1$ rad/s), $C_2$ prevents the system from "ringing" or oscillating wildly when hit by a step input.Higher Modulus Margin ($M_s$): As you saw in your search loop, $C_1$ likely struggled to stay below the 6dB requirement. $C_2$ allows you to push the crossover frequency ($f_c$) while keeping the Nyquist plot far away from the $-1$ point, making the system much more robust against instability.Improved Disturbance Rejection: Because the notch filter allows for a higher $K$ and better-tuned $\alpha$, the sensitivity $S_2$ is often lower at the resonance frequency than $S_1$, meaning the system is less sensitive to external noise at that specific frequency.
+
+
+%question h)
+
+
+% 1. Simulation Setup
+t_sim = 0:0.1:1500;
+Ar = 0.1;
+wr = 0.01;
+r = Ar * sin(wr * t_sim);
+
+
+% 3. Simulate Error Signals
+% S is the transfer function from r to e (e = S*r)
+e1 = lsim(S1, r, t_sim);
+e2 = lsim(S2, r, t_sim);
+
+% 4. Plotting
+figure(4);
+plot(t_sim, e1, 'r--', 'LineWidth', 1.2); hold on;
+plot(t_sim, e2, 'b', 'LineWidth', 1.2);
+grid on;
+xlabel('Time [s]');
+ylabel('Tracking Error e(t) [m]');
+title('Tracking Error Comparison: r(t) = 0.1 sin(0.01t)');
+legend('Error C1 (Lead-Lag)', 'Error C2 (Notch)');
+
+% 5. Peak Error Analysis
+fprintf('Peak Error C1: %.6f m\n', max(abs(e1)));
+fprintf('Peak Error C2: %.6f m\n', max(abs(e2)));
+
+% question i)
+
+% 1. Simulation Setup
+t_dist = 0:0.01:50;
+Ad = 100;
+wd = 0.8;
+d = Ad * sin(wd * t_dist);
+
+% 2. Transfer Function from d to e: -G/(1+CG)
+% Note: feedback(G, C) calculates G/(1+GC)
+Ge1 = -feedback(G, C1);
+Ge2 = -feedback(G, C2);
+
+% 3. Simulate Disturbance Effect
+ed1 = lsim(Ge1, d, t_dist);
+ed2 = lsim(Ge2, d, t_dist);
+
+% 4. Plotting
+figure(5);
+plot(t_dist, ed1, 'r--', 'LineWidth', 1.2); hold on;
+plot(t_dist, ed2, 'b', 'LineWidth', 1.2);
+grid on;
+xlabel('Time [s]');
+ylabel('Error e(t) [m]');
+title('Disturbance Rejection: d(t) = 100 sin(0.8t)');
+legend('Error C1 (Lead-Lag)', 'Error C2 (Notch)');
+
+% 5. Magnitude Analysis
+fprintf('Peak Disturbance Error C1: %.6f m\n', max(abs(ed1)));
+fprintf('Peak Disturbance Error C2: %.6f m\n', max(abs(ed2)));
